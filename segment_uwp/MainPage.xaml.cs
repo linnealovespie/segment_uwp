@@ -36,15 +36,23 @@ namespace segment_uwp
     {
         private LearningModel _learningModel = null;
         private LearningModelDeviceKind _inferenceDeviceSelected = LearningModelDeviceKind.DirectX;
-        private LearningModelSession _session;
         private LearningModelBinding _binding;
         private string _modelSource = "fcn-resnet50-11.onnx";
         private bool _useGpu = true;
-        private string _imgSource = "charlie.PNG";// "testimg.jpg";
-        private string _inputImageDescription;
-        private string _outputImageDescription;
-        uint _inWidth, _inHeight, _outWidth, _outHeight;
-        private BitmapDecoder _decoder = null;
+        private string _imgSource = "testimg.jpg";
+        uint _inWidth, _inHeight;
+
+        LearningModelSession tensorizationSession = null;
+        LearningModelSession normalizeSession = null;
+        LearningModelSession modelSession = null;
+        LearningModelSession labelsSession = null;
+        LearningModelSession backgroundSession = null;
+        LearningModelSession blurSession = null;
+        LearningModelSession foregroundSession = null;
+        LearningModelSession detensorizationSession = null;
+
+
+
 
         public MainPage()
         {
@@ -60,25 +68,22 @@ namespace segment_uwp
             Debug.Write("LoadModel Lock | ");
 
             _binding?.Clear();
-            _session?.Dispose();
+            modelSession?.Dispose();
 
             StorageFile modelFile = StorageFile.GetFileFromApplicationUriAsync(new Uri($"ms-appx:///Assets/{_modelSource}")).GetAwaiter().GetResult();
             _learningModel = LearningModel.LoadFromStorageFileAsync(modelFile).GetAwaiter().GetResult();
             _inferenceDeviceSelected = _useGpu ? LearningModelDeviceKind.DirectX : LearningModelDeviceKind.Cpu;
 
-            _session = CreateLearningModelSession(_learningModel);
-            _binding = new LearningModelBinding(_session);
+            modelSession = CreateLearningModelSession(_learningModel);
+            _binding = new LearningModelBinding(modelSession);
 
             debugModelIO();
-            _inputImageDescription = _learningModel.InputFeatures.ToList().First().Name;
-            _outputImageDescription = _learningModel.OutputFeatures.ToList().First().Name;
 
             Debug.Write("LoadModel Unlock\n");
         }
 
         public void debugModelIO()
         {
-            string _inName, _outName;
             foreach (var inputF in _learningModel.InputFeatures)
             {
                 TensorFeatureDescriptor tfDesc = inputF as TensorFeatureDescriptor;
@@ -91,16 +96,6 @@ namespace segment_uwp
                 Debug.WriteLine($"output | kind:{outputF.Kind}, name:{outputF.Name}" +
                     $" Shape: {string.Join(",", tfDesc.Shape.ToArray<long>())}");
             }
-        }
-
-        private async void UIButtonAcquireImage_Click(object sender, RoutedEventArgs e)
-        {
-            var file = StorageFile.GetFileFromApplicationUriAsync(new Uri($"ms-appx:///Assets/{_imgSource}")).GetAwaiter().GetResult();
-            var stream = file.OpenAsync(FileAccessMode.Read).GetAwaiter().GetResult();
-            var decoder = BitmapDecoder.CreateAsync(stream).GetAwaiter().GetResult();
-            _inWidth = decoder.PixelWidth;
-            _inHeight = decoder.PixelHeight;
-            Debug.WriteLine("Loaded image");
         }
 
         private LearningModelSession CreateLearningModelSession(LearningModel model, bool closeModel = true)
@@ -134,7 +129,7 @@ namespace segment_uwp
             return builder.CreateModel();
         }
 
-        public static LearningModel GetForeground(long n, long c, long h, long w)
+        public static LearningModel GetOutputFrame(long n, long c, long h, long w)
         {
             var builder = LearningModelBuilder.Create(12)
                 .Inputs.Add(LearningModelBuilder.CreateTensorFeatureDescriptor("InputImage", TensorKind.Float, new long[] { n, c, h, w }))
@@ -189,14 +184,12 @@ namespace segment_uwp
         public async void getImageAsync()
         {
             Debug.WriteLine("In GetImage");
-            StorageFile file = StorageFile.GetFileFromApplicationUriAsync(new Uri($"ms-appx:///Assets/testimg.jpg")).GetAwaiter().GetResult();
+            StorageFile file = StorageFile.GetFileFromApplicationUriAsync(new Uri($"ms-appx:///Assets/{_imgSource}")).GetAwaiter().GetResult();
             using (IRandomAccessStream stream = file.OpenAsync(FileAccessMode.Read).GetAwaiter().GetResult())
             {
-                Debug.WriteLine("Got stream");
-                //BitmapDecoder decoder = BitmapDecoder.CreateAsync(stream).GetAwaiter().GetResult(); //needs to step through
-
+                //Debug.WriteLine("Got stream");
                 BitmapDecoder decoder = await BitmapDecoder.CreateAsync(stream);
-                Debug.WriteLine("Got decoder");
+                //Debug.WriteLine("Got decoder");
 
                 _inWidth = decoder.PixelWidth;
                 _inHeight = decoder.PixelHeight;
@@ -204,95 +197,87 @@ namespace segment_uwp
                 var pixelDataProvider = await decoder.GetPixelDataAsync();//.GetAwaiter().GetResult();
                 Debug.WriteLine("Got pixeldata");
 
+                // 1. Tensorize input image
                 var bytes = pixelDataProvider.DetachPixelData();
                 var buffer = bytes.AsBuffer(); // Does this do a copy??
                 var inputRawTensor = TensorUInt8Bit.CreateFromBuffer(new long[] { 1, buffer.Length }, buffer);
-
-                // 3 channel NCHW
                 var nextOutputShape = new long[] { 1, 3, _inHeight, _inWidth };
                 var tensorizedImg = TensorFloat.Create(nextOutputShape); // Need to keep this intermediate for blur/bckground
 
-                // *** Reshape initial input
-                LearningModelSession tensorizationSession = CreateLearningModelSession(
+                // Reshape initial input
+                tensorizationSession = CreateLearningModelSession(
                     TensorizationModels.ReshapeFlatBufferToNCHW(1, 4, _inHeight, _inWidth));
                 var tensorizationBinding = Evaluate(tensorizationSession, inputRawTensor, tensorizedImg);
                 Debug.WriteLine($"Intermediate Shape: {string.Join(",", tensorizedImg.Shape.ToArray<long>())}");
 
-                // *** Normalize
+                // 2. Normalize input image
                 float[] mean = new float[] { 0.485f, 0.456f, 0.406f };
                 float[] std = new float[] { 0.229f, 0.224f, 0.225f };
                 // Already sliced out alpha, but normalize0_1 expects the input to still have it- could just write another version later
-                LearningModelSession normalizeSession = CreateLearningModelSession(
+                normalizeSession = CreateLearningModelSession(
                     TensorizationModels.Normalize0_1ThenZScore(_inHeight, _inWidth, 4, mean, std));
                 var intermediateTensor = TensorFloat.Create(tensorizedImg.Shape);
                 var normalizationBinding = Evaluate(normalizeSession, tensorizedImg, intermediateTensor);
 
-                // *** Run through actual model
+                // 3. Run through actual model
                 var modelOutputShape = new long[] { 1, 21, _inHeight, _inWidth };
                 var modelOutputTensor = TensorFloat.Create(modelOutputShape);
-                var modelBinding = Evaluate(_session, intermediateTensor, modelOutputTensor);
+                var modelBinding = Evaluate(modelSession, intermediateTensor, modelOutputTensor);
 
-                // *** Get the class predictions for each pixel
+                // 4. Get the class predictions for each pixel
                 var rawLabels = TensorFloat.Create(new long[] { 1, 1, _inHeight, _inWidth });
-                LearningModelSession labelsSession = CreateLearningModelSession(ArgMax(1, _inHeight, _inWidth));
+                labelsSession = CreateLearningModelSession(ArgMax(1, _inHeight, _inWidth));
                 var labelsBinding = Evaluate(labelsSession, modelOutputTensor, rawLabels);
-                //rawLabels.GetAsVectorView().Where(x => x > 0 );
-                //Debug.WriteLine(String.Join(", ",rawLabels.GetAsVectorView().Where(x => x> 0 ).ToArray()));
 
-                // Clip the mask to {0,1}
-                /*intermediateTensor = TensorFloat.Create(nextOutputShape);
-                var clipSession = new LearningModelSession(ClipMask(1, 1, _inHeight, _inWidth));
-                var clipBinding = Evaluate(clipSession, rawLabels, intermediateTensor);
-                Debug.WriteLine(String.Join(", ", intermediateTensor.GetAsVectorView().Where(x => x > 0 ).ToArray())); */
-
+                // 5. Extract just the blurred background based on mask
                 // Create a blurred version of the original picture
                 intermediateTensor = TensorFloat.Create(nextOutputShape);
-                var blurSession = CreateLearningModelSession(TensorizationModels.AveragePool(50));
+                blurSession = CreateLearningModelSession(TensorizationModels.AveragePool(50));
                 var blurBinding = Evaluate(blurSession, tensorizedImg, intermediateTensor);
 
-                // *** Get just the background based on mask
                 var blurredImg = TensorFloat.Create(nextOutputShape);
-                var backgroundSession = CreateLearningModelSession(GetBackground(1, 3, _inHeight, _inWidth));
+                backgroundSession = CreateLearningModelSession(GetBackground(1, 3, _inHeight, _inWidth));
                 var binding = new LearningModelBinding(backgroundSession);
                 binding.Bind(backgroundSession.Model.InputFeatures[0].Name, intermediateTensor); // Intermediate tensor isn't on GPU? 
                 binding.Bind(backgroundSession.Model.InputFeatures[1].Name, rawLabels);
                 binding.Bind(backgroundSession.Model.OutputFeatures[0].Name, blurredImg);
                 EvaluateInternal(backgroundSession, binding);
 
-                // *** Get just the foreground based on mask
+                // 6. Extract just the foreground based on mask and combine with background
                 intermediateTensor = TensorFloat.Create(nextOutputShape);
-                var foregroundSession = CreateLearningModelSession(GetForeground(1, 3, _inHeight, _inWidth));
+                foregroundSession = CreateLearningModelSession(GetOutputFrame(1, 3, _inHeight, _inWidth));
                 binding = new LearningModelBinding(foregroundSession);
                 binding.Bind(foregroundSession.Model.InputFeatures[0].Name, tensorizedImg);
                 binding.Bind(foregroundSession.Model.InputFeatures[1].Name, rawLabels);
                 binding.Bind(foregroundSession.Model.InputFeatures[2].Name, blurredImg);
                 binding.Bind(foregroundSession.Model.OutputFeatures[0].Name, intermediateTensor);
                 EvaluateInternal(foregroundSession, binding);
-                //var foregroundBinding = Evaluate(foregroundSession, rawLabels, intermediateTensor);
 
-                //** Detensorize and output
+                // 7. Detensorize and  display output
                 var outputFrame = Detensorize(intermediateTensor);
-
-                SoftwareBitmap displayBitmap = outputFrame.SoftwareBitmap;
-                //Image control only accepts BGRA8 encoding and Premultiplied/no alpha channel. This checks and converts
-                //the SoftwareBitmap we want to bind.
-                if (displayBitmap.BitmapPixelFormat != BitmapPixelFormat.Bgra8 ||
-                    displayBitmap.BitmapAlphaMode != BitmapAlphaMode.Premultiplied)
-                {
-                    displayBitmap = SoftwareBitmap.Convert(displayBitmap, BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied);
-                }
-
-                
-
-                // get software bitmap souce
-                var source = new SoftwareBitmapSource();
-                source.SetBitmapAsync(displayBitmap).GetAwaiter();
-                // draw the input image
-                InputImage.Source = source;
+                RenderOutputFrame(outputFrame);
+            
             }
 
         }       
 
+        public void RenderOutputFrame(VideoFrame outputFrame)
+        {
+            SoftwareBitmap displayBitmap = outputFrame.SoftwareBitmap;
+            //Image control only accepts BGRA8 encoding and Premultiplied/no alpha channel. This checks and converts
+            //the SoftwareBitmap we want to bind.
+            if (displayBitmap.BitmapPixelFormat != BitmapPixelFormat.Bgra8 ||
+                displayBitmap.BitmapAlphaMode != BitmapAlphaMode.Premultiplied)
+            {
+                displayBitmap = SoftwareBitmap.Convert(displayBitmap, BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied);
+            }
+
+            // get software bitmap souce
+            var source = new SoftwareBitmapSource();
+            source.SetBitmapAsync(displayBitmap).GetAwaiter();
+            // draw the input image
+            InputImage.Source = source;
+        }
         private VideoFrame Detensorize(TensorFloat intermediateTensor)
         {
             // Change from Int64 to float
@@ -308,7 +293,7 @@ namespace segment_uwp
             var outputImage = new SoftwareBitmap(BitmapPixelFormat.Bgra8, w, h, BitmapAlphaMode.Ignore);
             var outputFrame = VideoFrame.CreateWithSoftwareBitmap(outputImage);
 
-            LearningModelSession detensorizationSession = CreateLearningModelSession(TensorizationModels.IdentityNCHW(1, c, _inHeight, _inWidth));
+            detensorizationSession = CreateLearningModelSession(TensorizationModels.IdentityNCHW(1, c, _inHeight, _inWidth));
             var descriptor = detensorizationSession.Model.InputFeatures[0] as TensorFeatureDescriptor;
             var detensorizerShape = descriptor.Shape;
             /*if (c != detensorizerShape[1] || h != detensorizerShape[2] || w != detensorizerShape[3])
