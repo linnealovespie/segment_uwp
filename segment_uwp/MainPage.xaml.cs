@@ -35,11 +35,11 @@ namespace segment_uwp
     public sealed partial class MainPage : Page
     {
         private LearningModel _learningModel = null;
-        private LearningModelDeviceKind _inferenceDeviceSelected = LearningModelDeviceKind.Default;
+        private LearningModelDeviceKind _inferenceDeviceSelected = LearningModelDeviceKind.DirectX;
         private LearningModelSession _session;
         private LearningModelBinding _binding;
         private string _modelSource = "fcn-resnet50-11.onnx";
-        private bool _useGpu = false;
+        private bool _useGpu = true;
         private string _imgSource = "charlie.PNG";// "testimg.jpg";
         private string _inputImageDescription;
         private string _outputImageDescription;
@@ -66,7 +66,7 @@ namespace segment_uwp
             _learningModel = LearningModel.LoadFromStorageFileAsync(modelFile).GetAwaiter().GetResult();
             _inferenceDeviceSelected = _useGpu ? LearningModelDeviceKind.DirectX : LearningModelDeviceKind.Cpu;
 
-            _session = new LearningModelSession(_learningModel, new LearningModelDevice(_inferenceDeviceSelected));
+            _session = CreateLearningModelSession(_learningModel);
             _binding = new LearningModelBinding(_session);
 
             debugModelIO();
@@ -101,6 +101,18 @@ namespace segment_uwp
             _inWidth = decoder.PixelWidth;
             _inHeight = decoder.PixelHeight;
             Debug.WriteLine("Loaded image");
+        }
+
+        private LearningModelSession CreateLearningModelSession(LearningModel model, bool closeModel = true)
+        {
+            var device = _useGpu ? new LearningModelDevice(LearningModelDeviceKind.DirectX): new LearningModelDevice(LearningModelDeviceKind.Cpu);
+            var options = new LearningModelSessionOptions()
+            {
+                CloseModelOnSessionCreation = closeModel, // Close the model to prevent extra memory usage
+                BatchSizeOverride = 0
+            };
+            var session = new LearningModelSession(model, device, options);
+            return session;
         }
 
         public static LearningModel ArgMax(long axis, long h, long w)
@@ -201,7 +213,8 @@ namespace segment_uwp
                 var tensorizedImg = TensorFloat.Create(nextOutputShape); // Need to keep this intermediate for blur/bckground
 
                 // *** Reshape initial input
-                LearningModelSession tensorizationSession = new LearningModelSession(TensorizationModels.ReshapeFlatBufferToNCHW(1, 4, _inHeight, _inWidth));
+                LearningModelSession tensorizationSession = CreateLearningModelSession(
+                    TensorizationModels.ReshapeFlatBufferToNCHW(1, 4, _inHeight, _inWidth));
                 var tensorizationBinding = Evaluate(tensorizationSession, inputRawTensor, tensorizedImg);
                 Debug.WriteLine($"Intermediate Shape: {string.Join(",", tensorizedImg.Shape.ToArray<long>())}");
 
@@ -209,7 +222,8 @@ namespace segment_uwp
                 float[] mean = new float[] { 0.485f, 0.456f, 0.406f };
                 float[] std = new float[] { 0.229f, 0.224f, 0.225f };
                 // Already sliced out alpha, but normalize0_1 expects the input to still have it- could just write another version later
-                LearningModelSession normalizeSession = new LearningModelSession(TensorizationModels.Normalize0_1ThenZScore(_inHeight, _inWidth, 4, mean, std));
+                LearningModelSession normalizeSession = CreateLearningModelSession(
+                    TensorizationModels.Normalize0_1ThenZScore(_inHeight, _inWidth, 4, mean, std));
                 var intermediateTensor = TensorFloat.Create(tensorizedImg.Shape);
                 var normalizationBinding = Evaluate(normalizeSession, tensorizedImg, intermediateTensor);
 
@@ -220,7 +234,7 @@ namespace segment_uwp
 
                 // *** Get the class predictions for each pixel
                 var rawLabels = TensorFloat.Create(new long[] { 1, 1, _inHeight, _inWidth });
-                LearningModelSession labelsSession = new LearningModelSession(ArgMax(1, _inHeight, _inWidth));
+                LearningModelSession labelsSession = CreateLearningModelSession(ArgMax(1, _inHeight, _inWidth));
                 var labelsBinding = Evaluate(labelsSession, modelOutputTensor, rawLabels);
                 //rawLabels.GetAsVectorView().Where(x => x > 0 );
                 //Debug.WriteLine(String.Join(", ",rawLabels.GetAsVectorView().Where(x => x> 0 ).ToArray()));
@@ -233,21 +247,21 @@ namespace segment_uwp
 
                 // Create a blurred version of the original picture
                 intermediateTensor = TensorFloat.Create(nextOutputShape);
-                var blurSession = new LearningModelSession(TensorizationModels.AveragePool(50));
+                var blurSession = CreateLearningModelSession(TensorizationModels.AveragePool(50));
                 var blurBinding = Evaluate(blurSession, tensorizedImg, intermediateTensor);
 
                 // *** Get just the background based on mask
                 var blurredImg = TensorFloat.Create(nextOutputShape);
-                var backgroundSession = new LearningModelSession(GetBackground(1, 3, _inHeight, _inWidth));
+                var backgroundSession = CreateLearningModelSession(GetBackground(1, 3, _inHeight, _inWidth));
                 var binding = new LearningModelBinding(backgroundSession);
-                binding.Bind(backgroundSession.Model.InputFeatures[0].Name, intermediateTensor);
+                binding.Bind(backgroundSession.Model.InputFeatures[0].Name, intermediateTensor); // Intermediate tensor isn't on GPU? 
                 binding.Bind(backgroundSession.Model.InputFeatures[1].Name, rawLabels);
                 binding.Bind(backgroundSession.Model.OutputFeatures[0].Name, blurredImg);
                 EvaluateInternal(backgroundSession, binding);
 
                 // *** Get just the foreground based on mask
                 intermediateTensor = TensorFloat.Create(nextOutputShape);
-                var foregroundSession = new LearningModelSession(GetForeground(1, 3, _inHeight, _inWidth));
+                var foregroundSession = CreateLearningModelSession(GetForeground(1, 3, _inHeight, _inWidth));
                 binding = new LearningModelBinding(foregroundSession);
                 binding.Bind(foregroundSession.Model.InputFeatures[0].Name, tensorizedImg);
                 binding.Bind(foregroundSession.Model.InputFeatures[1].Name, rawLabels);
@@ -294,7 +308,7 @@ namespace segment_uwp
             var outputImage = new SoftwareBitmap(BitmapPixelFormat.Bgra8, w, h, BitmapAlphaMode.Ignore);
             var outputFrame = VideoFrame.CreateWithSoftwareBitmap(outputImage);
 
-            LearningModelSession detensorizationSession = new LearningModelSession(TensorizationModels.IdentityNCHW(1, c, _inHeight, _inWidth));
+            LearningModelSession detensorizationSession = CreateLearningModelSession(TensorizationModels.IdentityNCHW(1, c, _inHeight, _inWidth));
             var descriptor = detensorizationSession.Model.InputFeatures[0] as TensorFeatureDescriptor;
             var detensorizerShape = descriptor.Shape;
             /*if (c != detensorizerShape[1] || h != detensorizerShape[2] || w != detensorizerShape[3])
