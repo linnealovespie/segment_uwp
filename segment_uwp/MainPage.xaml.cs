@@ -122,6 +122,58 @@ namespace segment_uwp
             return builder.CreateModel();
         }
 
+        public static LearningModel GetForeground(long n, long c, long h, long w)
+        {
+            var builder = LearningModelBuilder.Create(12)
+                .Inputs.Add(LearningModelBuilder.CreateTensorFeatureDescriptor("InputImage", TensorKind.Float, new long[] { n, c, h, w }))
+                .Inputs.Add(LearningModelBuilder.CreateTensorFeatureDescriptor("InputMask", TensorKind.Float, new long[] { n, 1, h, w })) // Broadcast to each color channel
+                .Inputs.Add(LearningModelBuilder.CreateTensorFeatureDescriptor("InputBackground", TensorKind.Float, new long[] { n, c, h, w }))
+                .Outputs.Add(LearningModelBuilder.CreateTensorFeatureDescriptor("Output", TensorKind.Float, new long[] { n, c, h, w }))
+                .Operators.Add(new LearningModelOperator("Clip")
+                    .SetInput("input", "InputMask")
+                    .SetConstant("max", TensorFloat.CreateFromIterable(new long[] { 1 }, new float[] { 1 }))
+                    .SetOutput("output", "MaskBinary"))
+                .Operators.Add(new LearningModelOperator("Mul")
+                    .SetInput("A", "InputImage")
+                    .SetInput("B", "MaskBinary")
+                    .SetOutput("C", "Foreground"))
+                .Operators.Add(new LearningModelOperator("Add")
+                    .SetInput("A", "InputBackground")
+                    .SetInput("B", "Foreground")
+                    .SetOutput("C", "Output"))
+                ;
+                
+            return builder.CreateModel();
+        }
+
+        public static LearningModel GetBackground(long n, long c, long h, long w)
+        {
+            var builder = LearningModelBuilder.Create(12)
+                .Inputs.Add(LearningModelBuilder.CreateTensorFeatureDescriptor("InputImage", TensorKind.Float, new long[] { n, c, h, w }))
+                .Inputs.Add(LearningModelBuilder.CreateTensorFeatureDescriptor("InputMask", TensorKind.Float, new long[] { n, 1, h, w })) // Broadcast to each color channel
+                .Outputs.Add(LearningModelBuilder.CreateTensorFeatureDescriptor("Output", TensorKind.Float, new long[] { n, c, h, w }))
+                .Operators.Add(new LearningModelOperator("Clip") // Make mask binary 
+                    .SetInput("input", "InputMask")
+                    .SetConstant("max", TensorFloat.CreateFromIterable(new long[] { 1 }, new float[] { 1 }))
+                    .SetOutput("output", "ClipMask"))
+                .Operators.Add(new LearningModelOperator("Mul") 
+                    .SetInput("A", "ClipMask")
+                    .SetConstant("B", TensorFloat.CreateFromIterable(new long[] { 1 }, new float[] { -1 }))
+                    .SetOutput("C", "NegMask"))
+                .Operators.Add(new LearningModelOperator("Add") // BackgroundMask = (1- InputMask)
+                    .SetConstant("A", TensorFloat.CreateFromIterable(new long[] { 1 }, new float[] { 1 }))
+                    .SetInput("B", "NegMask")
+                    .SetOutput("C", "BackgroundMask"))
+                .Operators.Add(new LearningModelOperator("Mul") // Extract the background
+                    .SetInput("A", "InputImage")
+                    .SetInput("B", "BackgroundMask")
+                    .SetOutput("C", "Output"))
+                ;
+
+
+            return builder.CreateModel();
+        }
+
         public async void getImageAsync()
         {
             Debug.WriteLine("In GetImage");
@@ -146,37 +198,66 @@ namespace segment_uwp
 
                 // 3 channel NCHW
                 var nextOutputShape = new long[] { 1, 3, _inHeight, _inWidth };
-                var intermediateTensor = TensorFloat.Create(nextOutputShape);
+                var tensorizedImg = TensorFloat.Create(nextOutputShape); // Need to keep this intermediate for blur/bckground
 
-                // From createLearningModelSession
+                // *** Reshape initial input
                 LearningModelSession tensorizationSession = new LearningModelSession(TensorizationModels.ReshapeFlatBufferToNCHW(1, 4, _inHeight, _inWidth));
-                var tensorizationBinding = Evaluate(tensorizationSession, inputRawTensor, intermediateTensor);
+                var tensorizationBinding = Evaluate(tensorizationSession, inputRawTensor, tensorizedImg);
+                Debug.WriteLine($"Intermediate Shape: {string.Join(",", tensorizedImg.Shape.ToArray<long>())}");
 
-                Debug.WriteLine($"Intermediate Shape: {string.Join(",", intermediateTensor.Shape.ToArray<long>())}");
-
-                // Normalize
+                // *** Normalize
                 float[] mean = new float[] { 0.485f, 0.456f, 0.406f };
                 float[] std = new float[] { 0.229f, 0.224f, 0.225f };
                 // Already sliced out alpha, but normalize0_1 expects the input to still have it- could just write another version later
                 LearningModelSession normalizeSession = new LearningModelSession(TensorizationModels.Normalize0_1ThenZScore(_inHeight, _inWidth, 4, mean, std));
-                var finalTensor = TensorFloat.Create(intermediateTensor.Shape);
-                var normalizationBinding = Evaluate(normalizeSession, intermediateTensor, finalTensor);
+                var intermediateTensor = TensorFloat.Create(tensorizedImg.Shape);
+                var normalizationBinding = Evaluate(normalizeSession, tensorizedImg, intermediateTensor);
 
-                // Run through actual model
+                // *** Run through actual model
                 var modelOutputShape = new long[] { 1, 21, _inHeight, _inWidth };
                 var modelOutputTensor = TensorFloat.Create(modelOutputShape);
-                var modelBinding = Evaluate(_session, finalTensor, modelOutputTensor);
+                var modelBinding = Evaluate(_session, intermediateTensor, modelOutputTensor);
 
-
-                // Get the class predictions for each pixel
+                // *** Get the class predictions for each pixel
                 var rawLabels = TensorFloat.Create(new long[] { 1, 1, _inHeight, _inWidth });
                 LearningModelSession labelsSession = new LearningModelSession(ArgMax(1, _inHeight, _inWidth));
                 var labelsBinding = Evaluate(labelsSession, modelOutputTensor, rawLabels);
                 //rawLabels.GetAsVectorView().Where(x => x > 0 );
                 //Debug.WriteLine(String.Join(", ",rawLabels.GetAsVectorView().Where(x => x> 0 ).ToArray()));
 
-                // Could technically scale into a picture now??
-                var outputFrame = Detensorize(rawLabels);
+                // Clip the mask to {0,1}
+                /*intermediateTensor = TensorFloat.Create(nextOutputShape);
+                var clipSession = new LearningModelSession(ClipMask(1, 1, _inHeight, _inWidth));
+                var clipBinding = Evaluate(clipSession, rawLabels, intermediateTensor);
+                Debug.WriteLine(String.Join(", ", intermediateTensor.GetAsVectorView().Where(x => x > 0 ).ToArray())); */
+
+                // Create a blurred version of the original picture
+                intermediateTensor = TensorFloat.Create(nextOutputShape);
+                var blurSession = new LearningModelSession(TensorizationModels.AveragePool(50));
+                var blurBinding = Evaluate(blurSession, tensorizedImg, intermediateTensor);
+
+                // *** Get just the background based on mask
+                var blurredImg = TensorFloat.Create(nextOutputShape);
+                var backgroundSession = new LearningModelSession(GetBackground(1, 3, _inHeight, _inWidth));
+                var binding = new LearningModelBinding(backgroundSession);
+                binding.Bind(backgroundSession.Model.InputFeatures[0].Name, intermediateTensor);
+                binding.Bind(backgroundSession.Model.InputFeatures[1].Name, rawLabels);
+                binding.Bind(backgroundSession.Model.OutputFeatures[0].Name, blurredImg);
+                EvaluateInternal(backgroundSession, binding);
+
+                // *** Get just the foreground based on mask
+                intermediateTensor = TensorFloat.Create(nextOutputShape);
+                var foregroundSession = new LearningModelSession(GetForeground(1, 3, _inHeight, _inWidth));
+                binding = new LearningModelBinding(foregroundSession);
+                binding.Bind(foregroundSession.Model.InputFeatures[0].Name, tensorizedImg);
+                binding.Bind(foregroundSession.Model.InputFeatures[1].Name, rawLabels);
+                binding.Bind(foregroundSession.Model.InputFeatures[2].Name, blurredImg);
+                binding.Bind(foregroundSession.Model.OutputFeatures[0].Name, intermediateTensor);
+                EvaluateInternal(foregroundSession, binding);
+                //var foregroundBinding = Evaluate(foregroundSession, rawLabels, intermediateTensor);
+
+                //** Detensorize and output
+                var outputFrame = Detensorize(intermediateTensor);
 
                 SoftwareBitmap displayBitmap = outputFrame.SoftwareBitmap;
                 //Image control only accepts BGRA8 encoding and Premultiplied/no alpha channel. This checks and converts
@@ -187,6 +268,8 @@ namespace segment_uwp
                     displayBitmap = SoftwareBitmap.Convert(displayBitmap, BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied);
                 }
 
+                
+
                 // get software bitmap souce
                 var source = new SoftwareBitmapSource();
                 source.SetBitmapAsync(displayBitmap).GetAwaiter();
@@ -194,8 +277,7 @@ namespace segment_uwp
                 InputImage.Source = source;
             }
 
-        }
-        
+        }       
 
         private VideoFrame Detensorize(TensorFloat intermediateTensor)
         {
@@ -209,7 +291,7 @@ namespace segment_uwp
 
             // Rather than writing the data into the software bitmap ourselves from a Tensor (which may be on the gpu)
             // we call an indentity model to move the gpu memory back to the cpu via WinML de-tensorization.
-            var outputImage = new SoftwareBitmap(BitmapPixelFormat.Gray8, w, h, BitmapAlphaMode.Ignore);
+            var outputImage = new SoftwareBitmap(BitmapPixelFormat.Bgra8, w, h, BitmapAlphaMode.Ignore);
             var outputFrame = VideoFrame.CreateWithSoftwareBitmap(outputImage);
 
             LearningModelSession detensorizationSession = new LearningModelSession(TensorizationModels.IdentityNCHW(1, c, _inHeight, _inWidth));

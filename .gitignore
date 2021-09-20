@@ -363,3 +363,5 @@ MigrationBackup/
 FodyWeavers.xsd
 
 .onnx
+/segment_uwp/Assets/fcn-resnet50-11.onnx
+*.onnx
